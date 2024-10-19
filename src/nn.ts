@@ -11,7 +11,35 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Modified by David Cato
 ==============================================================================*/
+
+/**
+ * An error function and its derivative.
+ */
+export interface ErrorFunction {
+  error: (output: number, target: number) => number;
+  der: (output: number, target: number) => number;
+}
+
+/** A node's activation function and its derivative. */
+export interface ActivationFunction {
+  output: (input: number) => number;
+  der: (input: number) => number;
+  compileToJs: (arg: string) => string;
+}
+
+/** Function that computes a penalty cost for a given weight in the network. */
+export interface RegularizationFunction {
+  output: (weight: number) => number;
+  der: (weight: number) => number;
+}
+
+/** Function that quantizes a given weight in the network. */
+export interface WeightQuantizationFunction {
+  output: (weight: number) => number;
+}
 
 /**
  * A node in a neural network. Each node has a state
@@ -57,36 +85,31 @@ export class Node {
   }
 
   /** Recomputes the node's output and returns it. */
-  updateOutput(): number {
+  updateOutput(weightQuantizationFunction: WeightQuantizationFunction): number {
     // Stores total input into the node.
     this.totalInput = this.bias;
     for (let j = 0; j < this.inputLinks.length; j++) {
       let link = this.inputLinks[j];
-      this.totalInput += link.weight * link.source.output;
+      let weight = weightQuantizationFunction ? weightQuantizationFunction.output(link.weight) : link.weight
+      this.totalInput += weight * link.source.output;
     }
     this.output = this.activation.output(this.totalInput);
     return this.output;
   }
-}
 
-/**
- * An error function and its derivative.
- */
-export interface ErrorFunction {
-  error: (output: number, target: number) => number;
-  der: (output: number, target: number) => number;
-}
+  compileToJs(): string {
+    // Stores total input into the node.
+    let js = this.bias.toPrecision(2) + "";
+    for (let j = 0; j < this.inputLinks.length; j++) {
+      let link = this.inputLinks[j];
+      js += ` + (${link.weight.toPrecision(2)} * ${link.source.compileToJsName()})`;
+    }
+    return this.activation.compileToJs(js);
+  }
 
-/** A node's activation function and its derivative. */
-export interface ActivationFunction {
-  output: (input: number) => number;
-  der: (input: number) => number;
-}
-
-/** Function that computes a penalty cost for a given weight in the network. */
-export interface RegularizationFunction {
-  output: (weight: number) => number;
-  der: (weight: number) => number;
+  compileToJsName(): string {
+    return "v" + this.id;
+  }
 }
 
 /** Built-in error functions */
@@ -110,6 +133,19 @@ export class Errors {
   }
 };
 
+/** Polyfill for SOFTPLUS */
+(Math as any).softplus = (Math as any).softplus || function(x) {
+  let threshold = 20;
+  let beta = 1;
+  if (x * beta > threshold) {
+    return x;
+  } else if (x === -Infinity) {
+    return 0;
+  } else {
+    return 1 / beta * (Math as any).log(1 + (Math as any).exp(beta * x));
+  }
+};
+
 /** Built-in activation functions */
 export class Activations {
   public static TANH: ActivationFunction = {
@@ -117,26 +153,49 @@ export class Activations {
     der: x => {
       let output = Activations.TANH.output(x);
       return 1 - output * output;
-    }
+    },
+    compileToJs: arg => `Math.tanh(${arg})`
   };
   public static RELU: ActivationFunction = {
     output: x => Math.max(0, x),
-    der: x => x <= 0 ? 0 : 1
+    der: x => x <= 0 ? 0 : 1,
+    compileToJs: arg => `Math.max(0, ${arg})`
   };
   public static SIGMOID: ActivationFunction = {
     output: x => 1 / (1 + Math.exp(-x)),
     der: x => {
       let output = Activations.SIGMOID.output(x);
       return output * (1 - output);
-    }
+    },
+    compileToJs: arg => `(1 / (1 + Math.exp(-(${arg}))))`
   };
   public static LINEAR: ActivationFunction = {
     output: x => x,
-    der: x => 1
+    der: x => 1,
+    compileToJs: arg => arg
+  };
+  public static SINE: ActivationFunction = {
+    output: x => (Math as any).sin(x),
+    der: x => (Math as any).cos(x),
+    compileToJs: arg => `Math.sin(${arg})`
+  };
+  public static SINC: ActivationFunction = {
+    output: x => x < 0.000001 ? 1 : (Math as any).sin(x) / x,
+    der: x => (x*x) < 0.000001 ? 0 : (x * (Math as any).cos(x) - (Math as any).sin(x)) / (x*x),
+    compileToJs: arg => `Math.sinc(${arg})`
+  };
+  public static MISH: ActivationFunction = {
+    output: x => x * Activations.TANH.output((Math as any).softplus(x)),
+    der: x => {
+      let sig_x = Activations.SIGMOID.output(x);
+      let tanh_sp_x = Activations.TANH.output((Math as any).softplus(x));
+      return tanh_sp_x * x * sig_x * (1 - tanh_sp_x * tanh_sp_x);
+    },
+    compileToJs: arg => `mish(${arg})`
   };
 }
 
-/** Build-in regularization functions */
+/** Built-in regularization functions */
 export class RegularizationFunction {
   public static L1: RegularizationFunction = {
     output: w => Math.abs(w),
@@ -145,6 +204,22 @@ export class RegularizationFunction {
   public static L2: RegularizationFunction = {
     output: w => 0.5 * w * w,
     der: w => w
+  };
+}
+
+/** Built-in weight quantization functions */
+export class WeightQuantizationFunction {
+  public static q16bit: WeightQuantizationFunction = {
+    output: w => (Math as any).round(w * 65536) / 65536
+  };
+  public static q8bit: WeightQuantizationFunction = {
+    output: w => (Math as any).round(w * 256) / 256
+  };
+  public static q4bit: WeightQuantizationFunction = {
+    output: w => (Math as any).round(w * 16) / 16
+  };
+  public static q2bit: WeightQuantizationFunction = {
+    output: w => (Math as any).round(w * 4) / 4
   };
 }
 
@@ -166,22 +241,20 @@ export class Link {
   accErrorDer = 0;
   /** Number of accumulated derivatives since the last update. */
   numAccumulatedDers = 0;
-  regularization: RegularizationFunction;
+//   regularization: RegularizationFunction;
 
   /**
    * Constructs a link in the neural network initialized with random weight.
    *
    * @param source The source node.
    * @param dest The destination node.
-   * @param regularization The regularization function that computes the
-   *     penalty for this weight. If null, there will be no regularization.
+//    * @param regularization The regularization function that computes the
+//    *     penalty for this weight. If null, there will be no regularization.
    */
-  constructor(source: Node, dest: Node,
-      regularization: RegularizationFunction, initZero?: boolean) {
+  constructor(source: Node, dest: Node, initZero?: boolean) {
     this.id = source.id + "-" + dest.id;
     this.source = source;
     this.dest = dest;
-    this.regularization = regularization;
     if (initZero) {
       this.weight = 0;
     }
@@ -204,7 +277,6 @@ export class Link {
 export function buildNetwork(
     networkShape: number[], activation: ActivationFunction,
     outputActivation: ActivationFunction,
-    regularization: RegularizationFunction,
     inputIds: string[], initZero?: boolean): Node[][] {
   let numLayers = networkShape.length;
   let id = 1;
@@ -230,7 +302,7 @@ export function buildNetwork(
         // Add links from nodes in the previous layer to this node.
         for (let j = 0; j < network[layerIdx - 1].length; j++) {
           let prevNode = network[layerIdx - 1][j];
-          let link = new Link(prevNode, node, regularization, initZero);
+          let link = new Link(prevNode, node, initZero);
           prevNode.outputs.push(link);
           node.inputLinks.push(link);
         }
@@ -250,7 +322,8 @@ export function buildNetwork(
  *     nodes in the network.
  * @return The final output of the network.
  */
-export function forwardProp(network: Node[][], inputs: number[]): number {
+export function forwardProp(network: Node[][], inputs: number[], 
+    weightQuantizationFunction: WeightQuantizationFunction): number {
   let inputLayer = network[0];
   if (inputs.length !== inputLayer.length) {
     throw new Error("The number of inputs must match the number of nodes in" +
@@ -266,7 +339,7 @@ export function forwardProp(network: Node[][], inputs: number[]): number {
     // Update all the nodes in this layer.
     for (let i = 0; i < currentLayer.length; i++) {
       let node = currentLayer[i];
-      node.updateOutput();
+      node.updateOutput(weightQuantizationFunction);
     }
   }
   return network[network.length - 1][0].output;
@@ -333,7 +406,7 @@ export function backProp(network: Node[][], target: number,
  * derivatives.
  */
 export function updateWeights(network: Node[][], learningRate: number,
-    regularizationRate: number) {
+    regularization: RegularizationFunction, regularizationRate: number) {
   for (let layerIdx = 1; layerIdx < network.length; layerIdx++) {
     let currentLayer = network[layerIdx];
     for (let i = 0; i < currentLayer.length; i++) {
@@ -350,8 +423,8 @@ export function updateWeights(network: Node[][], learningRate: number,
         if (link.isDead) {
           continue;
         }
-        let regulDer = link.regularization ?
-            link.regularization.der(link.weight) : 0;
+        let regulDer = regularization ?
+            regularization.der(link.weight) : 0;
         if (link.numAccumulatedDers > 0) {
           // Update the weight based on dE/dw.
           link.weight = link.weight -
@@ -359,7 +432,7 @@ export function updateWeights(network: Node[][], learningRate: number,
           // Further update the weight based on regularization.
           let newLinkWeight = link.weight -
               (learningRate * regularizationRate) * regulDer;
-          if (link.regularization === RegularizationFunction.L1 &&
+          if (regularization === RegularizationFunction.L1 &&
               link.weight * newLinkWeight < 0) {
             // The weight crossed 0 due to the regularization term. Set it to 0.
             link.weight = 0;
@@ -392,4 +465,19 @@ export function forEachNode(network: Node[][], ignoreInputs: boolean,
 /** Returns the output node in the network. */
 export function getOutputNode(network: Node[][]) {
   return network[network.length - 1][0];
+}
+
+export function compileNetworkToJs(network: Node[][]): string {
+  const inputLayer = network[0];
+  let js = `function(${inputLayer.map(node => node.compileToJsName()).join(", ")}) {\n`;  
+  for (let layerIdx = 1; layerIdx < network.length; layerIdx++) {
+    let currentLayer = network[layerIdx];
+    for (let i = 0; i < currentLayer.length; i++) {
+      let node = currentLayer[i];
+      js += `  const ${node.compileToJsName()} = ${node.compileToJs()};\n`;
+    }
+  }
+  js += `  return ${network[network.length - 1][0].compileToJsName()};\n`;
+  js += `}`;
+  return js;
 }
